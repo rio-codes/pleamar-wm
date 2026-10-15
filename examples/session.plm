@@ -10,8 +10,8 @@
 //   ~/.config/pleamar/keys.conf): this scene only declares the actions.
 //   Super+T / Super+Return  a terminal     Super+Q  close the one with the keyboard
 //   Super+arrows        the keyboard to the next / previous window
-//   Super+Shift+Left    make it lead (if it already leads, to the left monitor)
-//   Super+Shift+Right   to the right monitor
+//   Super+Shift+Left    make it lead (if it already leads, to the left monitor, or pool before)
+//   Super+Shift+Right   to the right monitor (or the next pool)
 //   Super+Shift+Up/Down change places with the one before / after it
 //   Super+Tab  everything at a glance       Super+-/+  the leader narrower / wider
 //   Super+1…9  that pool of this monitor    Super+Ctrl+Up/Down  the pool above / below
@@ -7257,10 +7257,15 @@ scene Session {
     on focus_next { focus win(next) }
     on focus_previous { focus win(previous) }
     // Moving it: left, to lead (and if it already leads, to the monitor on the
-    // left); right, to the monitor on the right; up and down, in the order.
+    // left, or the workspace before); right, to the monitor on the right (or
+    // the next workspace); up and down, in the order.
+    let ws.fmon = pick(fscreen, win.shown.0, win.shown.1, win.shown.2, win.shown.3)
+    let ws.flast = pick(fscreen, win.used.0, win.used.1, win.used.2, win.used.3) + 1
     on move_left while fplace > 0.5 { promote win(win.focus) }
-    on move_left while fplace < 0.5 and fscreen > 0.5 { send win(win.focus) to 0 }
-    on move_right while fscreen < 0.5 { send win(win.focus) to 1 }
+    on move_left while fplace < 0.5 and screens.count > 1 and fscreen > 0.5 { send win(win.focus) to fscreen - 1 }
+    on move_left while fplace < 0.5 and (screens.count <= 1 or fscreen <= 0.5) and ws.fmon > 1 { send win(win.focus) to workspace max(ws.fmon - 1, 1) }
+    on move_right while screens.count > 1 and fscreen < screens.count - 1 { send win(win.focus) to fscreen + 1 }
+    on move_right while screens.count <= 1 or fscreen >= screens.count - 1 { send win(win.focus) to workspace min(ws.fmon + 1, min(ws.flast, 9)) }
     on move_up { swap win(win.focus) with win(previous) }
     on move_down { swap win(win.focus) with win(next) }
     // The leader narrower or wider.

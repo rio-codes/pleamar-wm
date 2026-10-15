@@ -1216,6 +1216,9 @@ impl State {
                 }
             }
             ToNest::Send(slot, screen) => {
+                if screen >= self.outputs.len() {
+                    return;
+                }
                 if let Some(Some(w)) = self.slots.get_mut(slot) {
                     // Carried somewhere on purpose: where it came from no longer calls it back.
                     w.home = None;
