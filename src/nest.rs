@@ -146,9 +146,11 @@ struct Content {
     changed: bool,
 }
 
-/// A program's window: a Wayland one (xdg-shell), or an X11 one (XWayland).
-/// Both are a surface of the compositor; they differ in how they are asked
-/// for a size, told they have the keyboard, or closed.
+/// The longest the windows wait for the scene to paint a frame of theirs
+/// before their monitor's beat tells them again: three frames at 165 Hz,
+/// more than a painting takes.
+const PAINT_PATIENCE: Duration = Duration::from_millis(20);
+
 /// What a program's frame callback waits for before it is told to draw again.
 #[derive(Clone, Copy, PartialEq)]
 enum Waits {
@@ -160,6 +162,9 @@ enum Waits {
     Window(usize),
 }
 
+/// A program's window: a Wayland one (xdg-shell), or an X11 one (XWayland).
+/// Both are a surface of the compositor; they differ in how they are asked
+/// for a size, told they have the keyboard, or closed.
 #[derive(Clone, PartialEq)]
 enum Toplevel {
     Xdg(ToplevelSurface),
@@ -552,9 +557,9 @@ struct State {
     /// (`PLEAMAR_TIMING`) Since the last census: the windows' commits, the
     /// ones with something new to show, and the frames told to the scene.
     tally: [u32; 3],
-    /// A window's frame has been told to the scene and not painted yet: its
-    /// frame callbacks wait for that.
-    awaiting_paint: bool,
+    /// A window's frame has been told to the scene and not painted yet (since
+    /// when): its frame callbacks wait for that, a while (`paint_awaited`).
+    awaiting_paint: Option<Instant>,
     /// The last time the frame callbacks waiting for the scene were answered.
     answered_at: Instant,
     /// Each monitor's beat: when a frame of it last reached the screen, and how many of its
@@ -832,7 +837,7 @@ fn run(max: usize, to_render: Sender<ToRender>, rx: Channel<ToNest>, ready: std:
         dirty: Vec::new(),
         callbacks: Vec::new(),
         tally: [0; 3],
-        awaiting_paint: false,
+        awaiting_paint: None,
         answered_at: Instant::now(),
         beats: Vec::new(),
         to_render,
@@ -875,12 +880,33 @@ fn run(max: usize, to_render: Sender<ToRender>, rx: Channel<ToNest>, ready: std:
     // What the dock has pinned (`dock …` in session.conf).
     let pins = crate::config::get().dock.iter().map(|w| crate::desktop::pin(w)).collect();
     let _ = state.to_render.send(ToRender::Nest(NestEvent::Dock(pins)));
+    // How each monitor starts (`layout …` in session.conf): its layout, or free.
+    // And its name, for whoever sets that from outside (the control centre).
+    for (k, m) in monitors.iter().enumerate().take(4) {
+        let _ = state.to_render.send(ToRender::Text(pleamar::scene::intern(&format!("monname.{k}")), m.name.clone()));
+        let Some(l) = crate::config::get().layout_of(&m.name) else { continue };
+        let free = l == crate::config::LAYOUTS.len() - 1;
+        if !free {
+            let _ = state.to_render.send(ToRender::ExternalFact(pleamar::scene::intern(&format!("lay.{k}")), l.to_string()));
+        }
+        let _ = state.to_render.send(ToRender::ExternalFact(pleamar::scene::intern(&format!("free.{k}")), if free { "1" } else { "0" }.into()));
+        println!("windows · {} starts {}", m.name, crate::config::LAYOUTS[l]);
+    }
+    // The control centre among the user's applications (Marea's finder, any
+    // launcher): written once, and again only if it changed.
+    if !monitors.is_empty() {
+        write_control_entry();
+    }
     let _ = ready.send(Some(()));
     // A session of its own starts what the desktop has (the wallpaper, Marea):
     // `PLEAMAR_WM_AUTOSTART`, or ~/.config/pleamar/autostart, one command a
     // line. The same file `pleamar --autostart` runs on another compositor;
     // what only makes sense here says so with `wm:` in front.
-    if !monitors.is_empty() {
+    // A screenless test session starts only what `PLEAMAR_WM_AUTOSTART` says:
+    // the user's own started their Marea and their remote beside the real
+    // session's, which rotated its log and took its port.
+    let headless = crate::portal::HEADLESS.load(std::sync::atomic::Ordering::Relaxed);
+    if !monitors.is_empty() && !(headless && std::env::var_os("PLEAMAR_WM_AUTOSTART").is_none()) {
         let file = std::env::var("PLEAMAR_WM_AUTOSTART").ok().or_else(|| crate::config::user_file("autostart", "autostart"));
         // With none of the user's, the one that comes with it (inside it).
         let text = match file.as_deref() {
@@ -2300,7 +2326,7 @@ impl State {
         let t = self.time();
         self.answered_at = Instant::now();
         if monitor.is_none() {
-            self.awaiting_paint = false;
+            self.awaiting_paint = None;
         }
         self.callbacks.retain(|(cb, waits)| {
             let now = match *waits {
@@ -2360,8 +2386,8 @@ impl State {
     /// since they were last answered. `None`: there are none, or they wait
     /// for the scene to paint what it was told.
     fn callbacks_due_in(&self) -> Option<Duration> {
-        if self.awaiting_paint {
-            return None;
+        if let Some(left) = self.paint_awaited() {
+            return Some(left);
         }
         self.callbacks
             .iter()
@@ -2373,9 +2399,19 @@ impl State {
             .min()
     }
 
+    /// How much longer the windows wait for the scene to paint what it was
+    /// told (`None`: they don't). Not beyond `PAINT_PATIENCE`: a frame told
+    /// that the scene had nothing to paint for (it changed nothing seen) left
+    /// them waiting until something else painted, and with the scene still a
+    /// browser's video on the other monitor got told to draw only every
+    /// quarter of a second.
+    fn paint_awaited(&self) -> Option<Duration> {
+        self.awaiting_paint.and_then(|at| PAINT_PATIENCE.checked_sub(at.elapsed())).filter(|d| !d.is_zero())
+    }
+
     /// Those whose wait is over (see `callbacks_due_in`), told.
     fn answer_due(&mut self) {
-        if self.awaiting_paint {
+        if self.paint_awaited().is_some() {
             return;
         }
         let t = self.time();
@@ -2418,7 +2454,7 @@ impl State {
     fn frame_done_all(&mut self) {
         let t = self.time();
         self.answered_at = Instant::now();
-        self.awaiting_paint = false;
+        self.awaiting_paint = None;
         for (cb, _) in self.callbacks.drain(..) {
             cb.done(t);
         }
@@ -2741,7 +2777,7 @@ impl State {
                 continue;
             }
             self.tally[2] += 1;
-            self.awaiting_paint = true;
+            self.awaiting_paint = self.awaiting_paint.or(Some(Instant::now()));
             self.tell(NestEvent::Frame { slot, geometry: g, pieces });
         }
     }
@@ -4367,3 +4403,19 @@ impl Dispatch<ZwlrOutputPowerV1, usize> for State {
 smithay::delegate_viewporter!(State);
 smithay::delegate_fractional_scale!(State);
 smithay::delegate_single_pixel_buffer!(State);
+
+/// `~/.local/share/applications/pleamar-wm-control.desktop`: the control
+/// centre, for whatever lists applications.
+fn write_control_entry() {
+    let Some(data) = std::env::var("XDG_DATA_HOME").ok().filter(|v| !v.is_empty()).or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/share"))) else { return };
+    let dir = format!("{data}/applications");
+    let file = format!("{dir}/pleamar-wm-control.desktop");
+    let text = "[Desktop Entry]\nName=Control centre\nGenericName=pleamar-wm settings\nComment=How each monitor lays its windows out, and what each key does\nExec=pleamar-wm control\nIcon=preferences-system\nType=Application\nCategories=Settings;DesktopSettings;\nKeywords=layout;tiling;scrolling;fractal;windows;keys;pleamar;\nOnlyShowIn=pleamar;\n";
+    if std::fs::read_to_string(&file).is_ok_and(|t| t == text) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::write(&file, text) {
+        eprintln!("windows · could not write {file}: {e}");
+    }
+}
